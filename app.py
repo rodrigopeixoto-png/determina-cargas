@@ -132,7 +132,7 @@ if arquivo_ifc is not None:
         
         with col1:
             st.subheader("Relatório Analítico por Parede")
-            st.dataframe(df_relatorio, use_container_width=True)
+            st.dataframe(df_relatorio)
             
             # Conversão para Excel em memória para download
             buffer = io.BytesIO()
