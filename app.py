@@ -11,30 +11,36 @@ import io
 import os
 import gc
 
-st.set_page_config(page_title="Descida de Cargas IFC", layout="wide")
+try:
+    import plotly.graph_objects as go
+    TEM_PLOTLY = True
+except ImportError:
+    TEM_PLOTLY = False
+
+st.set_page_config(page_title="Cargas no Radier - IFC", layout="wide")
 
 st.title("Descida de Cargas para Radier (IFC -> Eberick)")
 st.markdown("""
-Esta rotina calcula a distribuição de cargas para o radier e gera uma **planta técnica limpa**, com fusão de elementos coincidentes e prevenção de colisão de textos.
+Esta plataforma calcula o peso próprio e a transferência tributária das lajes sobre as paredes, gerando a **tabela detalhada por componente**, a **planta cotada 2D** e o **modelo tridimensional interativo** para lançamento estrutural.
 """)
 
-# --- PARÂMETROS NA BARRA LATERAL ---
+# --- BARRA LATERAL ---
 st.sidebar.header("Parâmetros de Carga")
 peso_alvenaria = st.sidebar.number_input("Peso Específico da Parede (kN/m³)", value=25.0, step=1.0)
 peso_concreto = st.sidebar.number_input("Peso Específico da Laje (kN/m³)", value=25.0, step=1.0)
 carga_acidental_laje = st.sidebar.number_input("Sobrecarga Acidental na Laje (kN/m²)", value=2.0, step=0.5)
 
 st.sidebar.header("Geometria Tributária")
-vao_medio_laje = st.sidebar.number_input("Vão Médio Livre dos Quartos (m)", value=4.15, step=0.05)
+vao_medio_laje = st.sidebar.number_input("Vão Médio dos Compartimentos (m)", value=4.15, step=0.05)
 
-st.sidebar.header("Controlo de Rótulos na Planta")
-exibir_rotulos = st.sidebar.checkbox("Exibir valores numéricos nas paredes", value=True)
-comp_minimo_rotulo = st.sidebar.slider("Comprimento mínimo de parede para rotular (m)", 0.5, 3.0, 1.5, 0.1)
-dist_min_entre_rotulos = st.sidebar.slider("Distância mínima entre textos (m)", 0.5, 2.5, 1.2, 0.1)
-tamanho_fonte = st.sidebar.slider("Tamanho da fonte", 5, 11, 7)
-resolucao_grid = st.sidebar.slider("Resolução da Malha Gráfica (m)", 0.1, 0.5, 0.25, 0.05)
+st.sidebar.header("Visualização 2D")
+exibir_rotulos_2d = st.sidebar.checkbox("Exibir rótulos numéricos no mapa 2D", value=True)
+comp_minimo_rotulo = st.sidebar.slider("Comprimento mínimo para rotular no 2D (m)", 0.5, 3.0, 1.5, 0.1)
+dist_min_entre_rotulos = st.sidebar.slider("Distância mínima entre textos 2D (m)", 0.5, 2.5, 1.2, 0.1)
+tamanho_fonte = st.sidebar.slider("Tamanho da fonte 2D", 5, 11, 7)
+resolucao_grid = st.sidebar.slider("Resolução da Malha 2D (m)", 0.1, 0.5, 0.25, 0.05)
 
-arquivo_ifc = st.file_uploader("Anexe o ficheiro IFC estrutural ou arquitetónico", type=["ifc"])
+arquivo_ifc = st.file_uploader("Anexe o ficheiro IFC", type=["ifc"])
 
 def obter_fator_comprimento(ifc):
     for unit in ifc.by_type("IfcSIUnit"):
@@ -69,8 +75,8 @@ def extrair_dimensoes_elemento(elemento, tipo, fator_comp):
         
     return float(comprimento), float(area), float(volume)
 
-def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_acidental, vao, 
-                                       resolucao, rotulos, comp_min_rot, dist_min_rot, tam_fonte):
+def processar_calculo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental, vao, 
+                               resolucao, rotulos, comp_min_rot, dist_min_rot, tam_fonte):
     ifc = ifcopenshell.open(caminho_ifc)
     fator_comp = obter_fator_comprimento(ifc)
     
@@ -117,7 +123,8 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
         if comp_m < 0.2:
             continue
 
-        peso_proprio = vol_m3 * p_alvenaria
+        peso_proprio_total = vol_m3 * p_alvenaria
+        peso_proprio_linear = peso_proprio_total / comp_m if comp_m > 0 else 0.0
 
         x0, y0, x1, y1 = 0.0, 0.0, 0.0, 0.0
         if w.ObjectPlacement:
@@ -135,31 +142,44 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
             except:
                 pass
 
+        # Classificação da influência da laje
         if comp_m < 1.5:
-            faixa_tributaria = 0.0
+            condicao_apoio = "Divisória Interna (Sem Carga de Laje)"
+            largura_influencia = 0.0
         else:
             eh_borda = (abs(y0 - y_min_edif) < 0.8) or (abs(y0 - y_max_edif) < 0.8)
-            faixa_tributaria = (vao / 2.0) if eh_borda else vao
+            if eh_borda:
+                condicao_apoio = "Apoio Simples (Fachada / Borda)"
+                largura_influencia = vao / 2.0
+            else:
+                condicao_apoio = "Apoio Duplo (Meação entre Quartos)"
+                largura_influencia = vao
 
-        carga_linear_laje = faixa_tributaria * q_superficial_laje
+        carga_linear_laje = largura_influencia * q_superficial_laje
         carga_total_laje = carga_linear_laje * comp_m
 
-        carga_linear_pp = peso_proprio / comp_m if comp_m > 0 else 0
-        carga_linear_total = carga_linear_pp + carga_linear_laje
-        carga_total_base = peso_proprio + carga_total_laje
+        carga_linear_total = peso_proprio_linear + carga_linear_laje
+        carga_total_base = peso_proprio_total + carga_total_laje
 
         linhas_grafico.append({
             'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
             'carga': carga_linear_total,
-            'comprimento': comp_m
+            'carga_laje': carga_linear_laje,
+            'carga_pp': peso_proprio_linear,
+            'comprimento': comp_m,
+            'nome': w.Name or "Parede"
         })
 
         relatorio.append({
-            "Nome": w.Name or "Parede",
+            "Identificação da Parede": w.Name or f"Parede #{w.id()}",
             "Comprimento (m)": round(comp_m, 2),
-            "Faixa Tributária (m)": round(faixa_tributaria, 2),
-            "Peso Próprio (kN)": round(peso_proprio, 2),
-            "Carga das Lajes (kN)": round(carga_total_laje, 2),
+            "Condição de Apoio da Laje": condicao_apoio,
+            "Largura de Influência da Laje (m)": round(largura_influencia, 2),
+            "Pressão da Laje (kN/m²)": round(q_superficial_laje, 2),
+            "Carga Linear da Laje (kN/m)": round(carga_linear_laje, 2),
+            "Carga Total da Laje (kN)": round(carga_total_laje, 2),
+            "Carga Linear Peso Próprio (kN/m)": round(peso_proprio_linear, 2),
+            "Peso Próprio Total (kN)": round(peso_proprio_total, 2),
             "CARGA TOTAL NA BASE (kN)": round(carga_total_base, 2),
             "CARGA LINEAR NO RADIER (kN/m)": round(carga_linear_total, 2),
             "Coord X0 (m)": round(x0, 2),
@@ -171,27 +191,22 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
     del ifc
     gc.collect()
 
-    # --- FUSÃO DE SEGMENTOS COINCIDENTES PARA O DESENHO ---
+    # --- FUSÃO DE ELEMENTOS COINCIDENTES PARA A PLANTA 2D ---
     linhas_consolidadas = []
     for p in linhas_grafico:
         xm, ym = (p['x0'] + p['x1']) / 2.0, (p['y0'] + p['y1']) / 2.0
         encontrado = False
         for c in linhas_consolidadas:
             cxm, cym = (c['x0'] + c['x1']) / 2.0, (c['y0'] + c['y1']) / 2.0
-            # Se os pontos médios estiverem a menos de 35 cm, assume o mesmo eixo de parede
             if ((xm - cxm)**2 + (ym - cym)**2)**0.5 < 0.35:
-                # Mantém a maior carga (segmento principal estrutural)
                 if p['carga'] > c['carga']:
-                    c['carga'] = p['carga']
-                    c['comprimento'] = p['comprimento']
-                    c['x0'], c['y0'] = p['x0'], p['y0']
-                    c['x1'], c['y1'] = p['x1'], p['y1']
+                    c.update(p)
                 encontrado = True
                 break
         if not encontrado:
             linhas_consolidadas.append(dict(p))
 
-    # --- GERAÇÃO DA PLANTA COTADA COM ANTI-COLISÃO ---
+    # --- MAPA 2D ---
     img_buffer = None
     if linhas_consolidadas:
         x_coords = [p['x0'] for p in linhas_consolidadas] + [p['x1'] for p in linhas_consolidadas]
@@ -216,11 +231,9 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
         cmap = plt.get_cmap('jet')
         img = ax.imshow(malha, extent=[x_min, x_max, y_min, y_max], origin='lower', cmap=cmap, interpolation='gaussian')
 
-        # Desenhar todos os eixos das paredes
         for p in linhas_consolidadas:
             ax.plot([p['x0'], p['x1']], [p['y0'], p['y1']], color='black', linewidth=1.5, alpha=0.9)
 
-        # Ordenar por comprimento decrescente para dar prioridade às paredes estruturais maiores
         linhas_ordenadas = sorted(linhas_consolidadas, key=lambda x: x['comprimento'], reverse=True)
         rotulos_colocados = []
 
@@ -232,11 +245,9 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
                 xm = (p['x0'] + p['x1']) / 2.0
                 ym = (p['y0'] + p['y1']) / 2.0
 
-                # Verificação de colisão com textos já impressos
                 colide = False
                 for rx, ry in rotulos_colocados:
-                    distancia = ((xm - rx)**2 + (ym - ry)**2)**0.5
-                    if distancia < dist_min_rot:
+                    if ((xm - rx)**2 + (ym - ry)**2)**0.5 < dist_min_rot:
                         colide = True
                         break
 
@@ -244,7 +255,6 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
                     continue
 
                 rotulos_colocados.append((xm, ym))
-
                 dx = abs(p['x1'] - p['x0'])
                 dy = abs(p['y1'] - p['y0'])
                 rotacao = 90 if dy > dx else 0
@@ -257,8 +267,8 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
                 )
 
         cbar = plt.colorbar(img, pad=0.02)
-        cbar.set_label('Carga Linear Aplicada no Radier (kN/m)', fontsize=11)
-        ax.set_title('Planta de Cargas no Radier - Rótulos Filtrados e Sem Sobreposição (kN/m)', fontsize=13, weight='bold')
+        cbar.set_label('Carga Linear no Radier (kN/m)', fontsize=11)
+        ax.set_title('Planta Cotada de Cargas no Radier (kN/m)', fontsize=13, weight='bold')
         ax.set_xlabel('Coordenada X (m)', fontsize=11)
         ax.set_ylabel('Coordenada Y (m)', fontsize=11)
         ax.grid(color='white', linestyle='--', alpha=0.3)
@@ -268,40 +278,133 @@ def processar_calculo_sem_sobreposicao(caminho_ifc, p_alvenaria, p_concreto, q_a
         plt.savefig(img_buffer, format='png', dpi=250)
         plt.close(fig)
 
-    return pd.DataFrame(relatorio), img_buffer
+    return pd.DataFrame(relatorio), img_buffer, linhas_consolidadas
 
-# --- INTERFACE PRINCIPAL ---
+def criar_visualizador_3d(linhas_paredes):
+    """Gera o modelo BIM 3D interativo com mapa térmico de cargas nas paredes"""
+    fig = go.Figure()
+    cargas = [p['carga'] for p in linhas_paredes]
+    c_min = min(cargas) if cargas else 0.0
+    c_max = max(cargas) if cargas else 50.0
+
+    altura_visual = 2.80
+
+    for p in linhas_paredes:
+        x0, y0 = p['x0'], p['y0']
+        x1, y1 = p['x1'], p['y1']
+        carga = p['carga']
+
+        # Geometria do prisma 3D da parede
+        x_mesh = [x0, x1, x1, x0, x0, x1, x1, x0]
+        y_mesh = [y0, y1, y1, y0, y0, y1, y1, y0]
+        z_mesh = [0.0, 0.0, altura_visual, altura_visual, 0.0, 0.0, altura_visual, altura_visual]
+
+        i_faces = [7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2]
+        j_faces = [3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3]
+        k_faces = [0, 7, 2, 3, 6, 7, 1, 1, 5, 5, 7, 6]
+
+        hover_texto = (
+            f"<b>{p['nome']}</b><br>"
+            f"Comprimento: {p['comprimento']:.2f} m<br>"
+            f"<b>Carga no Radier: {carga:.2f} kN/m</b><br>"
+            f"Carga da Laje: {p['carga_laje']:.2f} kN/m<br>"
+            f"Peso Próprio: {p['carga_pp']:.2f} kN/m"
+        )
+
+        fig.add_trace(go.Mesh3d(
+            x=x_mesh, y=y_mesh, z=z_mesh,
+            i=i_faces, j=j_faces, k=k_faces,
+            intensity=[carga] * 8,
+            colorscale='Jet',
+            cmin=c_min,
+            cmax=c_max,
+            showscale=False,
+            hoverinfo='text',
+            text=hover_texto,
+            opacity=0.92
+        ))
+
+        # Arestas de contorno em preto
+        fig.add_trace(go.Scatter3d(
+            x=[x0, x1, x1, x0, x0],
+            y=[y0, y1, y1, y0, y0],
+            z=[0, 0, altura_visual, altura_visual, 0],
+            mode='lines',
+            line=dict(color='black', width=3),
+            hoverinfo='skip',
+            showlegend=False
+        ))
+
+    # Barra de escala de cores do 3D
+    fig.add_trace(go.Scatter3d(
+        x=[None], y=[None], z=[None],
+        mode='markers',
+        marker=dict(
+            colorscale='Jet',
+            cmin=c_min,
+            cmax=c_max,
+            color=[c_min, c_max],
+            colorbar=dict(title=dict(text="Carga Linear (kN/m)", side="right"), thickness=18, len=0.8),
+            showscale=True
+        ),
+        showlegend=False
+    ))
+
+    fig.update_layout(
+        title="<b>Modelo Tridimensional Interativo de Cargas nas Paredes</b>",
+        scene=dict(
+            xaxis=dict(title='X (m)', backgroundcolor="rgb(240, 243, 246)", gridcolor="white"),
+            yaxis=dict(title='Y (m)', backgroundcolor="rgb(240, 243, 246)", gridcolor="white"),
+            zaxis=dict(title='Z (m)', backgroundcolor="rgb(240, 243, 246)", gridcolor="white"),
+            aspectmode='data',
+            camera=dict(eye=dict(x=-1.4, y=-1.8, z=1.3))
+        ),
+        margin=dict(l=0, r=0, b=0, t=40)
+    )
+    return fig
+
+# --- EXECUÇÃO ---
 if arquivo_ifc is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
         tmp_file.write(arquivo_ifc.read())
         tmp_caminho = tmp_file.name
 
     try:
-        df, img_buffer = processar_calculo_sem_sobreposicao(
+        df, img_buffer, linhas_3d = processar_calculo_completo(
             tmp_caminho, peso_alvenaria, peso_concreto, carga_acidental_laje,
-            vao_medio_laje, resolucao_grid, exibir_rotulos, 
+            vao_medio_laje, resolucao_grid, exibir_rotulos_2d, 
             comp_minimo_rotulo, dist_min_entre_rotulos, tamanho_fonte
         )
 
-        st.subheader("Resultados Analíticos das Cargas no Radier")
+        st.subheader("Resultados Analíticos e Tributários das Cargas no Radier")
         if not df.empty:
-            st.dataframe(df)
+            st.dataframe(df, use_container_width=True)
 
-            if img_buffer:
-                st.image(img_buffer, caption="Planta Limpa com Prevenção de Colisão e Rótulos Filtrados (kN/m)")
+            tab1, tab2 = st.tabs(["Visualizador 3D Interativo", "Planta Técnica 2D"])
+
+            with tab1:
+                if TEM_PLOTLY and linhas_3d:
+                    fig_3d = criar_visualizador_3d(linhas_3d)
+                    st.plotly_chart(fig_3d, use_container_width=True)
+                elif not TEM_PLOTLY:
+                    st.info("Para ativar o visualizador 3D, adicione `plotly` ao ficheiro requirements.txt.")
+
+            with tab2:
+                if img_buffer:
+                    st.image(img_buffer, caption="Planta de Cargas Cotada com Prevenção de Sobreposição (kN/m)")
 
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Tabela de Cargas')
                 if img_buffer:
-                    ws = writer.book.create_sheet('Mapa Visual Cotado')
+                    ws = writer.book.create_sheet('Mapa Visual 2D')
                     img_buffer.seek(0)
                     ws.add_image(OpenpyxlImage(img_buffer), 'B2')
 
             st.download_button(
-                label="📥 Descarregar Folha de Cálculo (.xlsx)",
+                label="📥 Descarregar Folha de Cálculo Estrutural (.xlsx)",
                 data=excel_buffer.getvalue(),
-                file_name="cargas_radier_sem_sobreposicao.xlsx",
+                file_name="cargas_radier_detalhadas.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
