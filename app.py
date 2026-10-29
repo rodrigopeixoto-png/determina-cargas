@@ -10,79 +10,85 @@ import gc
 
 st.set_page_config(page_title="Extrator de Cargas IFC", layout="wide")
 
-st.title("Extração de Cargas para Radier (IFC)")
-st.write("Versão Otimizada: Processamento focado em baixo consumo de memória.")
+st.title("Extração de Cargas (Paredes e Lajes)")
+st.write("Versão Otimizada: Extrai paredes e lajes em abas separadas.")
 
 st.sidebar.header("Parâmetros")
 peso_alvenaria = st.sidebar.number_input("Peso Específico da Parede (kN/m³)", value=13.0, step=1.0)
+peso_concreto = st.sidebar.number_input("Peso Específico da Laje (kN/m³)", value=25.0, step=1.0)
 
 arquivo_ifc = st.file_uploader("Anexe o arquivo .ifc", type=["ifc"])
 
-def processar_ifc_otimizado(caminho_temporario, peso_alvenaria):
-    # Abre o ficheiro sem carregar representações 3D pesadas
-    ifc = ifcopenshell.open(caminho_temporario)
+def extrair_dados_elemento(ifc, element_ids, peso_especifico, tipo="Parede"):
+    dados = []
     
-    # Extrai apenas os IDs para não manter todos os objetos em memória
-    paredes_ids = [p.id() for p in ifc.by_type("IfcWall")] + [p.id() for p in ifc.by_type("IfcWallStandardCase")]
-    
-    dados_relatorio = []
-    
-    # Processador de progresso para a interface
-    barra_progresso = st.progress(0)
-    texto_progresso = st.empty()
-    total = len(paredes_ids)
-    
-    for i, p_id in enumerate(paredes_ids):
+    for p_id in element_ids:
         try:
-            parede = ifc.by_id(p_id)
-            psets = ifcopenshell.util.element.get_psets(parede) or {}
-            quantities = psets.get("Qto_WallBaseQuantities", {})
+            elemento = ifc.by_id(p_id)
+            psets = ifcopenshell.util.element.get_psets(elemento) or {}
             
-            comprimento = quantities.get("Length", 0)
+            # Tenta buscar nas quantidades base (parede ou laje)
+            qto_nome = "Qto_WallBaseQuantities" if tipo == "Parede" else "Qto_SlabBaseQuantities"
+            quantities = psets.get(qto_nome, {})
+            
+            comprimento = quantities.get("Length", 0) # Para lajes pode não ter comprimento linear direto
             volume = quantities.get("NetVolume", 0)
+            area = quantities.get("GrossArea", quantities.get("NetArea", 0))
             
             if volume == 0:
                 dimensions = psets.get("Dimensions", {})
                 comprimento = dimensions.get("Length", 0) / 1000
                 volume = dimensions.get("Volume", 0)
+                area = dimensions.get("Area", 0)
 
-            if volume == 0 or comprimento == 0:
+            if volume == 0:
                 continue
 
-            carga_parede = volume * peso_alvenaria
-            carga_linear = carga_parede / comprimento
+            carga_total = volume * peso_especifico
             
             x_origem, y_origem = 0.0, 0.0
-            if parede.ObjectPlacement:
-                matriz = ifcopenshell.util.placement.get_local_placement(parede.ObjectPlacement)
+            if elemento.ObjectPlacement:
+                matriz = ifcopenshell.util.placement.get_local_placement(elemento.ObjectPlacement)
                 x_origem = matriz[0][3]
                 y_origem = matriz[1][3]
 
-            dados_relatorio.append({
-                "Nome": parede.Name if parede.Name else "Parede",
-                "Compr (m)": round(comprimento, 2),
-                "Carga (kN)": round(carga_parede, 2),
-                "Linear (kN/m)": round(carga_linear, 2),
+            linha_dado = {
+                "Nome": elemento.Name if elemento.Name else f"{tipo} Genérica",
+                "Volume (m³)": round(volume, 2),
+                "Carga Total (kN)": round(carga_total, 2),
                 "X (m)": round(x_origem, 2),
                 "Y (m)": round(y_origem, 2)
-            })
+            }
+            
+            if tipo == "Parede" and comprimento > 0:
+                linha_dado["Compr (m)"] = round(comprimento, 2)
+                linha_dado["Linear (kN/m)"] = round(carga_total / comprimento, 2)
+            elif tipo == "Laje" and area > 0:
+                linha_dado["Área (m²)"] = round(area, 2)
+                linha_dado["Superficial (kN/m²)"] = round(carga_total / area, 2)
+                
+            dados.append(linha_dado)
             
         except Exception:
             pass
             
-        # Atualiza o progresso
-        if i % 10 == 0:
-            barra_progresso.progress((i + 1) / total)
-            texto_progresso.text(f"A processar: {i+1} de {total} paredes...")
+    return dados
+
+def processar_ifc_completo(caminho_temporario, peso_alvenaria, peso_concreto):
+    ifc = ifcopenshell.open(caminho_temporario)
+    
+    paredes_ids = [p.id() for p in ifc.by_type("IfcWall")] + [p.id() for p in ifc.by_type("IfcWallStandardCase")]
+    lajes_ids = [p.id() for p in ifc.by_type("IfcSlab")]
+    
+    st.write(f"Encontradas {len(paredes_ids)} paredes e {len(lajes_ids)} lajes. A processar...")
+    
+    dados_paredes = extrair_dados_elemento(ifc, paredes_ids, peso_alvenaria, "Parede")
+    dados_lajes = extrair_dados_elemento(ifc, lajes_ids, peso_concreto, "Laje")
             
-    # Força a limpeza da memória RAM
     del ifc
     gc.collect()
     
-    barra_progresso.empty()
-    texto_progresso.empty()
-    
-    return pd.DataFrame(dados_relatorio)
+    return pd.DataFrame(dados_paredes), pd.DataFrame(dados_lajes)
 
 if arquivo_ifc is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
@@ -90,21 +96,27 @@ if arquivo_ifc is not None:
         tmp_caminho = tmp_file.name
 
     try:
-        df_relatorio = processar_ifc_otimizado(tmp_caminho, peso_alvenaria)
+        df_paredes, df_lajes = processar_ifc_completo(tmp_caminho, peso_alvenaria, peso_concreto)
         
-        st.subheader("Relatório de Cargas")
-        if not df_relatorio.empty:
-            st.dataframe(df_relatorio)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Relatório de Paredes")
+            st.dataframe(df_paredes)
+        with col2:
+            st.subheader("Relatório de Lajes")
+            st.dataframe(df_lajes)
             
+        if not df_paredes.empty or not df_lajes.empty:
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_relatorio.to_excel(writer, index=False, sheet_name='Cargas')
+                if not df_paredes.empty:
+                    df_paredes.to_excel(writer, index=False, sheet_name='Paredes')
+                if not df_lajes.empty:
+                    df_lajes.to_excel(writer, index=False, sheet_name='Lajes')
             
-            st.download_button("📥 Baixar Tabela Excel", buffer.getvalue(), "cargas.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        else:
-            st.warning("Não foram encontradas paredes com dados de volume válidos.")
+            st.download_button("📥 Baixar Tabela Excel (Paredes e Lajes)", buffer.getvalue(), "cargas_completas.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     except Exception as e:
-        st.error(f"Erro de memória: {e}")
+        st.error(f"Erro de processamento: {e}")
     finally:
         os.remove(tmp_caminho)
