@@ -1,7 +1,11 @@
 import streamlit as st
 import ifcopenshell
 import ifcopenshell.util.element
+import ifcopenshell.util.placement
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from openpyxl.drawing.image import Image as OpenpyxlImage
 import tempfile
 import io
 import os
@@ -9,22 +13,22 @@ import gc
 
 st.set_page_config(page_title="Descida de Cargas IFC", layout="wide")
 
-st.title("Descida de Cargas para Radier (Paredes + Lajes)")
+st.title("Extração e Mapa de Cargas para Radier")
 st.markdown("""
-Esta rotina calcula a descida de cargas de cima para baixo. 
-A carga das lajes de cada piso é distribuída pelas paredes desse mesmo piso (proporcionalmente ao comprimento de cada parede). 
-A carga acumulada desce para os pisos inferiores até chegar à base (Radier).
+Faz a **descida de cargas** (Lajes -> Paredes -> Radier) e exporta um **Excel com 2 abas**: 
+1. Tabela com os valores finais.
+2. Mapa gráfico planificado para auxiliar no lançamento no Eberick/TQS.
 """)
 
 st.sidebar.header("Parâmetros de Carga")
-peso_alvenaria = st.sidebar.number_input("Peso Específico da Parede (kN/m³)", value=13.0, step=1.0)
-peso_laje = st.sidebar.number_input("Peso Específico da Laje (kN/m³)", value=25.0, step=1.0)
-carga_acidental_laje = st.sidebar.number_input("Carga Acidental/Revestimento na Laje (kN/m²)", value=2.0, step=0.5)
+peso_alvenaria = st.sidebar.number_input("Peso Específico Parede (kN/m³)", value=13.0, step=1.0)
+peso_laje = st.sidebar.number_input("Peso Específico Laje (kN/m³)", value=25.0, step=1.0)
+carga_acidental_laje = st.sidebar.number_input("Carga Acidental (kN/m²)", value=2.0, step=0.5)
+resolucao_grid = st.sidebar.slider("Resolução do Mapa (m)", 0.1, 1.0, 0.25, 0.05)
 
 arquivo_ifc = st.file_uploader("Anexe o arquivo .ifc", type=["ifc"])
 
 def extrair_geometria_basica(elemento, tipo):
-    """Tenta extrair as dimensões básicas sem carregar a malha 3D pesada"""
     psets = ifcopenshell.util.element.get_psets(elemento) or {}
     qto_nome = "Qto_WallBaseQuantities" if tipo == "IfcWall" else "Qto_SlabBaseQuantities"
     quantities = psets.get(qto_nome, {})
@@ -41,28 +45,22 @@ def extrair_geometria_basica(elemento, tipo):
         
     return comprimento, area, volume
 
-def processar_descida_cargas(caminho_ifc, p_alvenaria, p_laje, q_acidental):
+def processar_modelo_e_grafico(caminho_ifc, p_alvenaria, p_laje, q_acidental, resolucao):
     ifc = ifcopenshell.open(caminho_ifc)
-    
-    # 1. Agrupar elementos por Pavimento (IfcBuildingStorey)
     pisos = ifc.by_type("IfcBuildingStorey")
-    # Ordenar pisos pela elevação (Z) de cima para baixo (descida de cargas)
     pisos_ordenados = sorted(pisos, key=lambda p: p.Elevation if p.Elevation is not None else 0, reverse=True)
     
     relatorio_base = []
-    carga_acumulada_de_cima = 0.0  # Carga que vem dos andares superiores
+    linhas_grafico = []
+    carga_acumulada_de_cima = 0.0
     
     barra = st.progress(0)
     texto = st.empty()
     
     for idx, piso in enumerate(pisos_ordenados):
-        texto.text(f"A calcular descida de cargas: {piso.Name}...")
+        texto.text(f"Processando piso {idx+1}/{len(pisos_ordenados)}: {piso.Name}...")
         
-        # Obter elementos contidos neste piso
-        paredes_piso = []
-        lajes_piso = []
-        
-        # Relacionamento de contenção espacial
+        paredes_piso, lajes_piso = [], []
         for rel in piso.ContainsElements:
             for elem in rel.RelatedElements:
                 if elem.is_a("IfcWall") or elem.is_a("IfcWallStandardCase"):
@@ -70,101 +68,152 @@ def processar_descida_cargas(caminho_ifc, p_alvenaria, p_laje, q_acidental):
                 elif elem.is_a("IfcSlab"):
                     lajes_piso.append(elem)
                     
-        # 2. Calcular o peso total das lajes neste piso
         carga_total_lajes_piso = 0.0
         for laje in lajes_piso:
             _, area, volume = extrair_geometria_basica(laje, "IfcSlab")
-            peso_proprio = volume * p_laje
-            carga_acidental_total = area * q_acidental
-            carga_total_lajes_piso += (peso_proprio + carga_acidental_total)
+            carga_total_lajes_piso += (volume * p_laje) + (area * q_acidental)
             
-        # 3. Distribuir as cargas para as paredes deste piso
         comprimento_total_paredes = 0.0
-        dados_paredes_atuais = []
+        dados_paredes = []
         
         for parede in paredes_piso:
             comprimento, _, volume = extrair_geometria_basica(parede, "IfcWall")
             if comprimento > 0 and volume > 0:
                 comprimento_total_paredes += comprimento
-                peso_proprio_parede = volume * p_alvenaria
-                dados_paredes_atuais.append({
-                    "id": parede.id(),
-                    "guid": parede.GlobalId,
-                    "nome": parede.Name if parede.Name else "Parede",
+                dados_paredes.append({
+                    "elemento": parede,
                     "comprimento": comprimento,
-                    "peso_proprio": peso_proprio_parede
+                    "peso_proprio": volume * p_alvenaria
                 })
         
-        # A carga a distribuir pelas paredes = Carga da Laje do Piso + Cargas que vêm dos pisos de cima
         carga_para_distribuir = carga_total_lajes_piso + carga_acumulada_de_cima
-        nova_carga_acumulada_para_baixo = 0.0
+        nova_carga_acumulada = 0.0
         
-        # 4. Aplicar a distribuição proporcional baseada no comprimento
-        for dp in dados_paredes_atuais:
-            taxa_distribuicao = dp["comprimento"] / comprimento_total_paredes if comprimento_total_paredes > 0 else 0
+        eh_ultimo_piso = (idx == len(pisos_ordenados) - 1)
+        
+        for dp in dados_paredes:
+            taxa = dp["comprimento"] / comprimento_total_paredes if comprimento_total_paredes > 0 else 0
+            carga_base_parede = dp["peso_proprio"] + (carga_para_distribuir * taxa)
+            carga_linear = carga_base_parede / dp["comprimento"]
+            nova_carga_acumulada += carga_base_parede
             
-            # Carga da laje que esta parede absorve
-            carga_laje_absorvida = carga_para_distribuir * taxa_distribuicao
-            
-            # Carga final na base desta parede
-            carga_total_base_parede = dp["peso_proprio"] + carga_laje_absorvida
-            carga_linear = carga_total_base_parede / dp["comprimento"]
-            
-            # Somar para o piso de baixo
-            nova_carga_acumulada_para_baixo += carga_total_base_parede
-            
-            # Se for o piso mais baixo (Térreo/Radier), guardamos para o relatório final
-            if idx == len(pisos_ordenados) - 1:
+            # Se for o radier, guarda os dados para a tabela E extrai as coordenadas para o gráfico
+            if eh_ultimo_piso:
+                nome = dp["elemento"].Name if dp["elemento"].Name else "Parede"
                 relatorio_base.append({
                     "Pavimento": piso.Name,
-                    "Nome Parede": dp["nome"],
+                    "Nome": nome,
                     "Comprimento (m)": round(dp["comprimento"], 2),
-                    "Peso Próprio (kN)": round(dp["peso_proprio"], 2),
-                    "Carga das Lajes/Superiores (kN)": round(carga_laje_absorvida, 2),
-                    "CARGA TOTAL NA BASE (kN)": round(carga_total_base_parede, 2),
-                    "CARGA LINEAR NO RADIER (kN/m)": round(carga_linear, 2)
+                    "Carga Base (kN)": round(carga_base_parede, 2),
+                    "CARGA LINEAR (kN/m)": round(carga_linear, 2)
                 })
                 
-        # Atualizar a carga que desce para o próximo ciclo (piso de baixo)
-        carga_acumulada_de_cima = nova_carga_acumulada_para_baixo
+                # Extração de Coordenadas Globais para o Gráfico
+                if dp["elemento"].ObjectPlacement:
+                    try:
+                        matriz = ifcopenshell.util.placement.get_local_placement(dp["elemento"].ObjectPlacement)
+                        x0, y0 = matriz[0][3], matriz[1][3]
+                        # Vetor de direção X local da parede para saber se está na horizontal ou vertical
+                        dir_x, dir_y = matriz[0][0], matriz[1][0]
+                        
+                        x1 = x0 + dir_x * dp["comprimento"]
+                        y1 = y0 + dir_y * dp["comprimento"]
+                        
+                        linhas_grafico.append({'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1, 'carga': carga_linear})
+                    except:
+                        pass
+                
+        carga_acumulada_de_cima = nova_carga_acumulada
         barra.progress((idx + 1) / len(pisos_ordenados))
 
+    # Limpeza CRÍTICA de RAM antes de gerar o gráfico
     del ifc
     gc.collect()
+    texto.text("Gerando mapa visual...")
+
+    # --- GERAR O GRÁFICO NA MEMÓRIA ---
+    img_buffer = None
+    if linhas_grafico:
+        x_coords = [p['x0'] for p in linhas_grafico] + [p['x1'] for p in linhas_grafico]
+        y_coords = [p['y0'] for p in linhas_grafico] + [p['y1'] for p in linhas_grafico]
+        x_min, x_max = min(x_coords) - 1, max(x_coords) + 1
+        y_min, y_max = min(y_coords) - 1, max(y_coords) + 1
+
+        grid_x = np.arange(x_min, x_max, resolucao)
+        grid_y = np.arange(y_min, y_max, resolucao)
+        malha = np.zeros((len(grid_y), len(grid_x)))
+
+        for p in linhas_grafico:
+            ix0 = np.searchsorted(grid_x, min(p['x0'], p['x1']))
+            ix1 = np.searchsorted(grid_x, max(p['x0'], p['x1']))
+            iy0 = np.searchsorted(grid_y, min(p['y0'], p['y1']))
+            iy1 = np.searchsorted(grid_y, max(p['y0'], p['y1']))
+            
+            if ix0 == ix1: ix1 += 1
+            if iy0 == iy1: iy1 += 1
+            
+            if iy1 <= len(grid_y) and ix1 <= len(grid_x):
+                malha[iy0:iy1, ix0:ix1] += p['carga']
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        cmap = plt.get_cmap('jet')
+        img = ax.imshow(malha, extent=[x_min, x_max, y_min, y_max], origin='lower', cmap=cmap)
+        
+        for p in linhas_grafico:
+            ax.plot([p['x0'], p['x1']], [p['y0'], p['y1']], color='black', linewidth=1.5, alpha=0.8)
+
+        plt.colorbar(img, label='Carga Linear (kN/m)')
+        ax.set_title('Mapa de Concentração no Radier')
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        fig.tight_layout()
+        
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png', dpi=150)
+        plt.close(fig)
+
     texto.empty()
     barra.empty()
-    
-    return pd.DataFrame(relatorio_base)
+    return pd.DataFrame(relatorio_base), img_buffer
 
-
+# --- EXECUÇÃO PRINCIPAL ---
 if arquivo_ifc is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
         tmp_file.write(arquivo_ifc.read())
         tmp_caminho = tmp_file.name
 
     try:
-        df_resultado = processar_descida_cargas(tmp_caminho, peso_alvenaria, peso_laje, carga_acidental_laje)
+        df, img_buffer = processar_modelo_e_grafico(tmp_caminho, peso_alvenaria, peso_laje, carga_acidental_laje, resolucao_grid)
         
-        st.subheader("Cargas Finais no Nível do Radier")
-        if not df_resultado.empty:
-            st.dataframe(df_resultado, use_container_width=True)
+        st.subheader("Resultados no Radier")
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
             
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_resultado.to_excel(writer, index=False, sheet_name='Cargas no Radier')
+            if img_buffer:
+                st.image(img_buffer, caption="Este mapa será exportado no Excel", use_container_width=True)
+            
+            # --- CRIAR EXCEL COM 2 ABAS ---
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Tabela de Cargas')
+                
+                if img_buffer:
+                    workbook = writer.book
+                    worksheet = workbook.create_sheet('Mapa Visual')
+                    img_buffer.seek(0)
+                    xl_img = OpenpyxlImage(img_buffer)
+                    worksheet.add_image(xl_img, 'B2')
             
             st.download_button(
-                label="📥 Baixar Planilha para Radier (Excel)", 
-                data=buffer.getvalue(), 
-                file_name="descida_cargas_radier.xlsx", 
+                label="📥 Baixar Excel Completo (Tabela + Mapa)", 
+                data=excel_buffer.getvalue(), 
+                file_name="cargas_eberick.xlsx", 
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-            
-            st.success("Cálculo concluído! As cargas das lajes foram distribuídas e acumuladas com o peso das paredes com sucesso.")
         else:
-            st.error("Não foram encontradas paredes no nível inferior ou o modelo não está estruturado por pavimentos (IfcBuildingStorey).")
+            st.error("Nenhuma carga encontrada no piso térreo.")
 
     except Exception as e:
-        st.error(f"Erro ao processar: {e}")
+        st.error(f"Erro no processamento: {e}")
     finally:
         os.remove(tmp_caminho)
