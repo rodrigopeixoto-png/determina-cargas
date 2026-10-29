@@ -51,7 +51,6 @@ def processar_ifc(caminho_temporario, peso_alvenaria):
         y_origem = matriz_global[1][3]
         
         # Como o grid é ortogonal simples, assumimos as paredes ao longo do eixo X para a matriz
-        # Em um projeto real mais complexo, o vetor de direção precisaria ser extraído da geometria
         x_fim = x_origem + comprimento
         y_fim = y_origem 
         
