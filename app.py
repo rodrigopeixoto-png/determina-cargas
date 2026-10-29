@@ -16,20 +16,24 @@ st.set_page_config(page_title="Descida de Cargas IFC", layout="wide")
 st.title("Descida de Cargas para Radier (IFC -> Eberick)")
 st.markdown("""
 Esta rotina realiza a **descida de cargas** (Lajes + Paredes superiores -> Paredes do piso térreo) 
-e gera o **mapa planificado de cargas lineares (kN/m)** para aplicação direta no radier.
+e gera a **planta cotada de cargas lineares (kN/m)** para aplicação direta no radier.
 """)
 
-# --- PARÂMETROS ---
+# --- PARÂMETROS NA BARRA LATERAL ---
 st.sidebar.header("Parâmetros de Carga")
 peso_alvenaria = st.sidebar.number_input("Peso Específico da Alvenaria/Parede (kN/m³)", value=13.0, step=1.0)
-peso_concreto = st.sidebar.number_input("Peso Específico do Concreto da Laje (kN/m³)", value=25.0, step=1.0)
+peso_concreto = st.sidebar.number_input("Peso Específico do Betão da Laje (kN/m³)", value=25.0, step=1.0)
 carga_acidental_laje = st.sidebar.number_input("Sobrecarga Acidental/Revestimento na Laje (kN/m²)", value=2.0, step=0.5)
+
+st.sidebar.header("Opções Visuais da Planta")
+exibir_rotulos = st.sidebar.checkbox("Exibir valores numéricos nas paredes", value=True)
+tamanho_fonte = st.sidebar.slider("Tamanho da fonte dos rótulos", min_value=5, max_value=11, value=7)
 resolucao_grid = st.sidebar.slider("Resolução da Malha Gráfica (m)", 0.1, 0.5, 0.25, 0.05)
 
 arquivo_ifc = st.file_uploader("Anexe o ficheiro IFC estrutural ou arquitetónico", type=["ifc"])
 
 def obter_fator_comprimento(ifc):
-    """Identifica se o IFC está em milímetros, centímetros ou metros"""
+    """Identifica se o IFC está em milímetros, centímetros ou metros."""
     for unit in ifc.by_type("IfcSIUnit"):
         if unit.UnitType == "LENGTHUNIT":
             if unit.Prefix == "MILLI":
@@ -43,7 +47,7 @@ def obter_fator_comprimento(ifc):
     return 0.001
 
 def extrair_dimensoes_elemento(elemento, tipo, fator_comprimento):
-    """Extrai dimensões geométricas convertendo comprimentos para metros"""
+    """Extrai dimensões geométricas convertendo comprimentos para metros."""
     psets = ifcopenshell.util.element.get_psets(elemento) or {}
     
     qto_nome = "Qto_WallBaseQuantities" if tipo == "IfcWall" else "Qto_SlabBaseQuantities"
@@ -62,13 +66,12 @@ def extrair_dimensoes_elemento(elemento, tipo, fator_comprimento):
         if area == 0.0:
             area = cotas.get("Área", 0.0)
             
-    # Converte comprimentos de milímetros para metros se necessário
     if comprimento > 100.0:
         comprimento = comprimento * fator_comprimento
         
     return float(comprimento), float(area), float(volume)
 
-def processar_descida_e_grafico(caminho_ifc, p_alvenaria, p_concreto, q_acidental, resolucao):
+def processar_descida_e_grafico(caminho_ifc, p_alvenaria, p_concreto, q_acidental, resolucao, rotulos, tam_fonte):
     ifc = ifcopenshell.open(caminho_ifc)
     fator_comp = obter_fator_comprimento(ifc)
     
@@ -94,19 +97,16 @@ def processar_descida_e_grafico(caminho_ifc, p_alvenaria, p_concreto, q_acidenta
                     elif elem.is_a("IfcSlab"):
                         lajes_piso.append(elem)
                         
-        # Fallback de associação caso o Revit não tenha estruturado a contenção espacial
         if not paredes_piso and idx == len(pisos_ordenados) - 1:
             paredes_piso = ifc.by_type("IfcWall") + ifc.by_type("IfcWallStandardCase")
         if not lajes_piso and idx < len(pisos_ordenados) - 1:
             lajes_piso = ifc.by_type("IfcSlab")
 
-        # 1. Carga total das lajes do piso
         carga_total_lajes = 0.0
         for laje in lajes_piso:
             _, area_m2, vol_m3 = extrair_dimensoes_elemento(laje, "IfcSlab", fator_comp)
             carga_total_lajes += (vol_m3 * p_concreto) + (area_m2 * q_acidental)
 
-        # 2. Dimensões das paredes deste piso
         comp_total_paredes = 0.0
         dados_paredes = []
         for parede in paredes_piso:
@@ -133,12 +133,10 @@ def processar_descida_e_grafico(caminho_ifc, p_alvenaria, p_concreto, q_acidenta
             if eh_radier:
                 nome_parede = dp["elemento"].Name if dp["elemento"].Name else "Parede"
                 
-                # Extração de Coordenadas Globais em METROS
                 x0, y0, x1, y1 = 0.0, 0.0, 0.0, 0.0
                 if dp["elemento"].ObjectPlacement:
                     try:
                         matriz = ifcopenshell.util.placement.get_local_placement(dp["elemento"].ObjectPlacement)
-                        # Multiplica por fator_comp para garantir coordenadas em metros
                         x0 = matriz[0][3] * fator_comp
                         y0 = matriz[1][3] * fator_comp
                         
@@ -155,7 +153,8 @@ def processar_descida_e_grafico(caminho_ifc, p_alvenaria, p_concreto, q_acidenta
                         linhas_grafico.append({
                             'x0': x0, 'y0': y0, 
                             'x1': x1, 'y1': y1, 
-                            'carga': carga_linear
+                            'carga': carga_linear,
+                            'comprimento': dp["comprimento_m"]
                         })
                     except Exception:
                         pass
@@ -178,16 +177,16 @@ def processar_descida_e_grafico(caminho_ifc, p_alvenaria, p_concreto, q_acidenta
 
     del ifc
     gc.collect()
-    texto.text("A gerar a representação gráfica do radier...")
+    texto.text("A gerar a representação gráfica do radier com valores numéricos...")
 
-    # --- GERAÇÃO DO MAPA VISUAL ---
+    # --- GERAÇÃO DA PLANTA COTADA COM RÓTULOS ---
     img_buffer = None
     if linhas_grafico:
         x_coords = [p['x0'] for p in linhas_grafico] + [p['x1'] for p in linhas_grafico]
         y_coords = [p['y0'] for p in linhas_grafico] + [p['y1'] for p in linhas_grafico]
         
-        x_min, x_max = min(x_coords) - 1.0, max(x_coords) + 1.0
-        y_min, y_max = min(y_coords) - 1.0, max(y_coords) + 1.0
+        x_min, x_max = min(x_coords) - 1.2, max(x_coords) + 1.2
+        y_min, y_max = min(y_coords) - 1.2, max(y_coords) + 1.2
 
         grid_x = np.arange(x_min, x_max, resolucao)
         grid_y = np.arange(y_min, y_max, resolucao)
@@ -204,23 +203,50 @@ def processar_descida_e_grafico(caminho_ifc, p_alvenaria, p_concreto, q_acidenta
             
             malha[iy0:iy1, ix0:ix1] += p['carga']
 
-        fig, ax = plt.subplots(figsize=(11, 5))
+        fig, ax = plt.subplots(figsize=(14, 6))
         cmap = plt.get_cmap('jet')
         img = ax.imshow(malha, extent=[x_min, x_max, y_min, y_max], origin='lower', cmap=cmap, interpolation='gaussian')
         
+        # Desenho das paredes e inserção dos rótulos
         for p in linhas_grafico:
-            ax.plot([p['x0'], p['x1']], [p['y0'], p['y1']], color='black', linewidth=1.5, alpha=0.85)
+            ax.plot([p['x0'], p['x1']], [p['y0'], p['y1']], color='black', linewidth=1.5, alpha=0.9)
 
-        cbar = plt.colorbar(img)
-        cbar.set_label('Carga Linear Aplicada (kN/m)', fontsize=10)
-        ax.set_title('Planta de Concentração de Cargas no Radier (kN/m)', fontsize=13, weight='bold')
-        ax.set_xlabel('Coordenada X (m)')
-        ax.set_ylabel('Coordenada Y (m)')
-        ax.grid(color='white', linestyle='--', alpha=0.3)
+            if rotulos and p['comprimento'] >= 0.7:
+                # Ponto médio do segmento de parede
+                xm = (p['x0'] + p['x1']) / 2.0
+                ym = (p['y0'] + p['y1']) / 2.0
+                
+                # Orientação do texto consoante o alinhamento
+                dx = abs(p['x1'] - p['x0'])
+                dy = abs(p['y1'] - p['y0'])
+                rotacao = 90 if dy > dx else 0
+                
+                ax.text(
+                    xm, ym, f"{p['carga']:.1f}",
+                    fontsize=tam_fonte,
+                    fontweight='bold',
+                    color='black',
+                    ha='center', va='center',
+                    rotation=rotacao,
+                    bbox=dict(
+                        boxstyle='round,pad=0.18',
+                        facecolor='white',
+                        edgecolor='black',
+                        linewidth=0.6,
+                        alpha=0.88
+                    )
+                )
+
+        cbar = plt.colorbar(img, pad=0.02)
+        cbar.set_label('Carga Linear Aplicada (kN/m)', fontsize=11)
+        ax.set_title('Planta de Concentração de Cargas no Radier (kN/m)', fontsize=14, weight='bold')
+        ax.set_xlabel('Coordenada X (m)', fontsize=11)
+        ax.set_ylabel('Coordenada Y (m)', fontsize=11)
+        ax.grid(color='white', linestyle='--', alpha=0.35)
         fig.tight_layout()
         
         img_buffer = io.BytesIO()
-        plt.savefig(img_buffer, format='png', dpi=200)
+        plt.savefig(img_buffer, format='png', dpi=250)
         plt.close(fig)
 
     texto.empty()
@@ -235,7 +261,8 @@ if arquivo_ifc is not None:
 
     try:
         df, img_buffer = processar_descida_e_grafico(
-            tmp_caminho, peso_alvenaria, peso_concreto, carga_acidental_laje, resolucao_grid
+            tmp_caminho, peso_alvenaria, peso_concreto, carga_acidental_laje,
+            resolucao_grid, exibir_rotulos, tamanho_fonte
         )
         
         st.subheader("Resultados Analíticos das Cargas no Radier")
@@ -243,24 +270,23 @@ if arquivo_ifc is not None:
             st.dataframe(df)
             
             if img_buffer:
-                st.image(img_buffer, caption="Mapa de Cargas Planificado (kN/m) para Lançamento no Eberick")
+                st.image(img_buffer, caption="Planta de Cargas Cotada com Valores (kN/m) para Lançamento no Eberick")
             
-            # Exportação de Excel com 2 Abas (Tabela + Desenho)
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Tabela de Cargas')
                 
                 if img_buffer:
                     workbook = writer.book
-                    worksheet = workbook.create_sheet('Mapa Visual')
+                    worksheet = workbook.create_sheet('Mapa Visual Cotado')
                     img_buffer.seek(0)
                     xl_img = OpenpyxlImage(img_buffer)
                     worksheet.add_image(xl_img, 'B2')
             
             st.download_button(
-                label="📥 Descarregar Folha de Cálculo Completa (.xlsx)", 
+                label="📥 Descarregar Folha de Cálculo Completa com Planta Cotada (.xlsx)", 
                 data=excel_buffer.getvalue(), 
-                file_name="descida_cargas_radier_eberick.xlsx", 
+                file_name="descida_cargas_radier_com_rotulos.xlsx", 
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
