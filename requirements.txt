@@ -1,6 +1,6 @@
-streamlit==1.32.0
-ifcopenshell==0.7.0.6
-pandas==2.2.1
-numpy==1.26.4
-matplotlib==3.8.3
-openpyxl==3.1.2
+streamlit
+ifcopenshell
+pandas
+numpy
+matplotlib
+openpyxl
