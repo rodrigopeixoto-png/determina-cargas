@@ -22,8 +22,7 @@ st.set_page_config(page_title="Descida de Cargas IFC", layout="wide")
 
 st.title("Descida de Cargas para Radier (IFC -> Eberick)")
 st.markdown("""
-Esta plataforma realiza a **descida completa de cargas** (2º Pavimento + Cobertura + Entrepiso -> Radier) 
-com **detecção autônoma do vão pelo IFC**, tabela detalhada por componente, mapa cotado 2D e visualizador 3D.
+Esta versão realiza a filtragem geométrica das paredes por altura real, diferenciando elementos que realmente continuam no 2º pavimento de tocos de corte do Revit. O vão modular é detectado autonomamente pelo modelo IFC.
 """)
 
 # --- BARRA LATERAL ---
@@ -60,22 +59,26 @@ def extrair_dimensoes_elemento(elemento, tipo, fator_comp):
     quantities = psets.get(qto_nome, {})
     
     comprimento = quantities.get("Length", 0.0)
+    altura = quantities.get("Height", 0.0)
     volume = quantities.get("NetVolume", quantities.get("GrossVolume", 0.0))
     area = quantities.get("NetArea", quantities.get("GrossArea", 0.0))
     
     if volume == 0.0 or comprimento == 0.0:
         cotas = psets.get("Cotas", {})
         if comprimento == 0.0: comprimento = cotas.get("Comprimento", 0.0)
+        if altura == 0.0: altura = cotas.get("Altura", 0.0)
         if volume == 0.0: volume = cotas.get("Volume", 0.0)
         if area == 0.0: area = cotas.get("Área", 0.0)
             
-    if comprimento > 100.0:
-        comprimento = comprimento * fator_comp
+    if comprimento > 100.0: comprimento = comprimento * fator_comp
+    if altura > 50.0: altura = altura * fator_comp
         
-    return float(comprimento), float(area), float(volume)
+    if altura == 0.0 and comprimento > 0 and volume > 0:
+        altura = volume / (comprimento * 0.15)
+        
+    return float(comprimento), float(altura), float(area), float(volume)
 
 def obter_nivel_elemento(elem, fator_comp):
-    """Identifica se o elemento pertence ao Nível 1 (Térreo) ou Nível 2 (Superior)"""
     if elem.ObjectPlacement:
         try:
             m = ifcopenshell.util.placement.get_local_placement(elem.ObjectPlacement)
@@ -93,10 +96,9 @@ def obter_nivel_elemento(elem, fator_comp):
     return 1
 
 def detectar_vao_autonomo(todas_paredes, fator_comp):
-    """Detecta automaticamente o vão modular livre dos quartos a partir das paredes do IFC"""
     candidatos = []
     for w in todas_paredes:
-        comp, _, _ = extrair_dimensoes_elemento(w, "IfcWall", fator_comp)
+        comp, _, _, _ = extrair_dimensoes_elemento(w, "IfcWall", fator_comp)
         if 2.5 <= comp <= 6.0:
             candidatos.append(round(comp, 2))
             
@@ -107,7 +109,6 @@ def detectar_vao_autonomo(todas_paredes, fator_comp):
     return 4.15
 
 def segmentos_sobrepostos_2d(seg1, seg2, tol_dist=0.45):
-    """Calcula o comprimento (m) de sobreposição espacial entre uma parede superior e uma térrea"""
     x0_1, y0_1, x1_1, y1_1 = seg1
     x0_2, y0_2, x1_2, y1_2 = seg2
     
@@ -117,7 +118,7 @@ def segmentos_sobrepostos_2d(seg1, seg2, tol_dist=0.45):
     if (dx1 > dy1 and dy2 > dx2) or (dy1 > dx1 and dx2 > dy2):
         return 0.0
         
-    if dx1 >= dy1:  # Alinhamento horizontal em X
+    if dx1 >= dy1:
         ym1 = (y0_1 + y1_1) / 2.0
         ym2 = (y0_2 + y1_2) / 2.0
         if abs(ym1 - ym2) > tol_dist:
@@ -128,7 +129,7 @@ def segmentos_sobrepostos_2d(seg1, seg2, tol_dist=0.45):
         inter_max = min(max_x1, max_x2)
         if inter_max > inter_min:
             return inter_max - inter_min
-    else:  # Alinhamento vertical em Y
+    else:
         xm1 = (x0_1 + x1_1) / 2.0
         xm2 = (x0_2 + x1_2) / 2.0
         if abs(xm1 - xm2) > tol_dist:
@@ -150,10 +151,9 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
     todas_paredes = ifc.by_type("IfcWall") + ifc.by_type("IfcWallStandardCase")
     todas_lajes = ifc.by_type("IfcSlab")
 
-    # 1. Detecção Autônoma do Vão
     vao_detectado = detectar_vao_autonomo(todas_paredes, fator_comp)
 
-    # 2. Pressão das Lajes Elevadas (ignora contrapiso/radier no solo)
+    # Lajes elevadas (excluindo piso/radier no solo)
     lajes_elevadas = []
     for s in todas_lajes:
         nome = (s.Name or "").upper()
@@ -162,14 +162,13 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
         lajes_elevadas.append(s)
 
     if lajes_elevadas:
-        _, a_tot, v_tot = extrair_dimensoes_elemento(lajes_elevadas[0], "IfcSlab", fator_comp)
+        _, _, a_tot, v_tot = extrair_dimensoes_elemento(lajes_elevadas[0], "IfcSlab", fator_comp)
         espessura_media = (v_tot / a_tot) if a_tot > 0 else 0.15
     else:
         espessura_media = 0.15
 
     q_superficial_laje = (espessura_media * p_concreto) + q_acidental
 
-    # 3. Separação de Paredes por Nível (Nível 1 vs Nível 2)
     paredes_n1 = []
     paredes_n2 = []
     for w in todas_paredes:
@@ -182,7 +181,6 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
     if not paredes_n1:
         paredes_n1 = todas_paredes
 
-    # Limites em Y para definir borda de fachada vs meação
     y_posicoes = []
     for w in paredes_n1:
         if w.ObjectPlacement:
@@ -192,11 +190,15 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
     y_min_edif = min(y_posicoes) if y_posicoes else -17.0
     y_max_edif = max(y_posicoes) if y_posicoes else -10.0
 
-    # 4. Processamento do 2º Pavimento (Nível 2)
+    # Processamento do Nível 2 filtrando tocos de parede (H <= 0.40m)
     dados_n2 = []
     for w2 in paredes_n2:
-        comp2, _, vol2 = extrair_dimensoes_elemento(w2, "IfcWall", fator_comp)
+        comp2, alt2, _, vol2 = extrair_dimensoes_elemento(w2, "IfcWall", fator_comp)
         if comp2 < 0.2:
+            continue
+
+        # FILTRO CRÍTICO: Tocos de corte de 25 cm não são paredes de 2º pavimento
+        if alt2 <= 0.40:
             continue
 
         pp2 = vol2 * p_alvenaria
@@ -219,30 +221,29 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
             except:
                 pass
 
-        # Laje de cobertura no 2º pavimento
-        if comp2 < 1.5:
-            faixa2 = 0.0
+        # Platibandas (1.0m) só têm peso próprio; apenas paredes plenas (H >= 1.5m) apoiam laje superior
+        if alt2 < 1.5:
+            q_cobertura = 0.0
         else:
             eh_borda = (abs(y0 - y_min_edif) < 0.8) or (abs(y0 - y_max_edif) < 0.8)
             faixa2 = (vao_detectado / 2.0) if eh_borda else vao_detectado
+            q_cobertura = faixa2 * q_superficial_laje
 
-        q_cobertura = faixa2 * q_superficial_laje
         q_tot2 = q_pp2 + q_cobertura
 
         dados_n2.append({
             'seg': (x0, y0, x1, y1),
             'comp': comp2,
-            'q_total': q_tot2,
-            'pp_linear': q_pp2,
-            'laje_linear': q_cobertura
+            'altura': alt2,
+            'q_total': q_tot2
         })
 
-    # 5. Processamento do Piso Térreo (Nível 1) com Transferência do 2º Pavimento
+    # Processamento do Nível 1 (Piso Térreo)
     relatorio = []
     linhas_grafico = []
 
     for w1 in paredes_n1:
-        comp1, _, vol1 = extrair_dimensoes_elemento(w1, "IfcWall", fator_comp)
+        comp1, alt1, _, vol1 = extrair_dimensoes_elemento(w1, "IfcWall", fator_comp)
         if comp1 < 0.2:
             continue
 
@@ -266,7 +267,7 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
             except:
                 pass
 
-        # Condição de apoio da laje de entrepiso
+        # Condição de apoio da laje de entrepiso/teto
         if comp1 < 1.5:
             condicao_apoio = "Divisória Interna (Sem Carga de Laje)"
             largura_influencia = 0.0
@@ -282,21 +283,20 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
         carga_linear_laje_terreo = largura_influencia * q_superficial_laje
         carga_total_laje_terreo = carga_linear_laje_terreo * comp1
 
-        # Verificação e Descida de Carga do 2º Pavimento Sobreposto
+        # Verificação se existe parede REAL no 2º pavimento acima
         seg1 = (x0, y0, x1, y1)
         carga_acumulada_n2 = 0.0
         comprimento_n2_sobreposto = 0.0
 
         for d2 in dados_n2:
             overlap = segmentos_sobrepostos_2d(seg1, d2['seg'])
-            if overlap > 0.35:
+            if overlap > 0.40:
                 carga_acumulada_n2 += d2['q_total'] * overlap
                 comprimento_n2_sobreposto += overlap
 
         q_vinda_n2 = carga_acumulada_n2 / comp1 if comp1 > 0 else 0.0
         tem_2_pavimentos = (comprimento_n2_sobreposto > 0.5)
 
-        # Cargas Finais no Radier
         carga_total_base = pp_terreo_total + carga_total_laje_terreo + carga_acumulada_n2
         carga_linear_total = pp_terreo_linear + carga_linear_laje_terreo + q_vinda_n2
 
@@ -331,7 +331,7 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
     del ifc
     gc.collect()
 
-    # --- FUSÃO DE ELEMENTOS COINCIDENTES PARA O 2D ---
+    # Fusão de elementos coincidentes para o desenho 2D
     linhas_consolidadas = []
     for p in linhas_grafico:
         xm, ym = (p['x0'] + p['x1']) / 2.0, (p['y0'] + p['y1']) / 2.0
@@ -346,7 +346,7 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
         if not encontrado:
             linhas_consolidadas.append(dict(p))
 
-    # --- GERAÇÃO DO MAPA COTADO 2D ---
+    # Geração da planta cotada 2D
     img_buffer = None
     if linhas_consolidadas:
         x_coords = [p['x0'] for p in linhas_consolidadas] + [p['x1'] for p in linhas_consolidadas]
@@ -408,7 +408,7 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
 
         cbar = plt.colorbar(img, pad=0.02)
         cbar.set_label('Carga Linear Aplicada no Radier (kN/m)', fontsize=11)
-        ax.set_title('Planta de Cargas no Radier - 2 Pavimentos Acumulados (kN/m)', fontsize=13, weight='bold')
+        ax.set_title('Planta de Cargas no Radier - Calibrada por Altura Real (kN/m)', fontsize=13, weight='bold')
         ax.set_xlabel('Coordenada X (m)', fontsize=11)
         ax.set_ylabel('Coordenada Y (m)', fontsize=11)
         ax.grid(color='white', linestyle='--', alpha=0.3)
@@ -421,7 +421,6 @@ def processar_modelo_completo(caminho_ifc, p_alvenaria, p_concreto, q_acidental,
     return pd.DataFrame(relatorio), img_buffer, linhas_consolidadas, vao_detectado
 
 def criar_visualizador_3d_acumulado(linhas_paredes):
-    """Renderiza o modelo tridimensional com diferenciação de altura para paredes com 2 pavimentos"""
     fig = go.Figure()
     cargas = [p['carga'] for p in linhas_paredes]
     c_min = min(cargas) if cargas else 0.0
@@ -432,7 +431,6 @@ def criar_visualizador_3d_acumulado(linhas_paredes):
         x1, y1 = p['x1'], p['y1']
         carga = p['carga']
         
-        # Paredes que continuam no 2º pavimento são extrudadas até 5.60 m
         altura_visual = 5.60 if p['tem_n2'] else 2.80
 
         x_mesh = [x0, x1, x1, x0, x0, x1, x1, x0]
@@ -491,7 +489,7 @@ def criar_visualizador_3d_acumulado(linhas_paredes):
     ))
 
     fig.update_layout(
-        title="<b>Modelo 3D de Cargas Acumuladas no Radier (Térreo + 2º Pavimento)</b>",
+        title="<b>Modelo 3D de Cargas Acumuladas no Radier</b>",
         scene=dict(
             xaxis=dict(title='X (m)', backgroundcolor="rgb(240, 243, 246)", gridcolor="white"),
             yaxis=dict(title='Y (m)', backgroundcolor="rgb(240, 243, 246)", gridcolor="white"),
